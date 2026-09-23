@@ -1,6 +1,9 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run_with_env(extra_env: dict) -> subprocess.CompletedProcess:
@@ -9,7 +12,7 @@ def _run_with_env(extra_env: dict) -> subprocess.CompletedProcess:
     env.update(extra_env)
     return subprocess.run(
         [sys.executable, "-c", "import app.config"],
-        cwd="/workspaces",
+        cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
