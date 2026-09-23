@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3.11 --version)",
+      "Bash(git --version)",
+      "Bash(gh auth *)",
+      "Bash(docker --version)",
+      "Bash(docker info *)",
+      "Read(//usr/bin/**)",
+      "Bash(command -v pyenv)",
+      "Bash(apt list *)",
+      "Bash(apt-cache policy *)"
+    ]
+  }
+}
