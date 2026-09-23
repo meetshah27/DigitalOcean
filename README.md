@@ -1,5 +1,7 @@
 # URL Shortener API
 
+![CI](https://github.com/meetshah27/DigitalOcean/actions/workflows/ci.yml/badge.svg)
+
 A production-ready REST API that shortens long URLs, redirects short codes to
 their original URL, and returns metadata about created links.
 
