@@ -46,6 +46,16 @@ class CodeTakenError(Exception):
         super().__init__(f"code already in use: {code}")
 
 
+class IdempotencyKeyRaceError(Exception):
+    """Another concurrent request already committed a result for this Idempotency-Key."""
+
+    def __init__(self, idempotency_key: str):
+        self.idempotency_key = idempotency_key
+        super().__init__(
+            f"idempotency key already committed by a concurrent request: {idempotency_key}"
+        )
+
+
 def _parse_dt(value: str | None) -> datetime | None:
     if value is None:
         return None
@@ -63,14 +73,15 @@ def _row_to_link(row: sqlite3.Row) -> LinkRow:
     )
 
 
-def get_link_by_code(conn: sqlite3.Connection, code: str) -> LinkRow | None:
-    conn.row_factory = sqlite3.Row
-    cur = conn.execute(
-        "SELECT id, code, original_url, created_at, expires_at, click_count "
-        "FROM links WHERE code = ?",
-        (code,),
-    )
-    row = cur.fetchone()
+def get_link_by_code(conn: sqlite3.Connection, lock: threading.Lock, code: str) -> LinkRow | None:
+    with lock:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT id, code, original_url, created_at, expires_at, click_count "
+            "FROM links WHERE code = ?",
+            (code,),
+        )
+        row = cur.fetchone()
     return _row_to_link(row) if row else None
 
 
@@ -81,13 +92,16 @@ class IdempotencyRow:
     code: str
 
 
-def get_idempotency_record(conn: sqlite3.Connection, key: str) -> IdempotencyRow | None:
-    conn.row_factory = sqlite3.Row
-    cur = conn.execute(
-        "SELECT key, request_hash, code FROM idempotency_keys WHERE key = ?",
-        (key,),
-    )
-    row = cur.fetchone()
+def get_idempotency_record(
+    conn: sqlite3.Connection, lock: threading.Lock, key: str
+) -> IdempotencyRow | None:
+    with lock:
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            "SELECT key, request_hash, code FROM idempotency_keys WHERE key = ?",
+            (key,),
+        )
+        row = cur.fetchone()
     if row is None:
         return None
     return IdempotencyRow(key=row["key"], request_hash=row["request_hash"], code=row["code"])
@@ -124,9 +138,11 @@ def create_link(
                         (idempotency_key, request_hash, code, created_at.isoformat()),
                     )
         except sqlite3.IntegrityError as exc:
+            if "idempotency_keys" in str(exc):
+                raise IdempotencyKeyRaceError(idempotency_key) from exc
             raise CodeTakenError(code) from exc
 
-    link = get_link_by_code(conn, code)
+    link = get_link_by_code(conn, lock, code)
     assert link is not None
     return link
 
@@ -139,24 +155,27 @@ def increment_click(conn: sqlite3.Connection, lock: threading.Lock, code: str) -
 
 def list_links(
     conn: sqlite3.Connection,
+    lock: threading.Lock,
     *,
     active_only: bool,
     now: datetime,
     limit: int,
     offset: int,
 ) -> list[LinkRow]:
-    conn.row_factory = sqlite3.Row
-    if active_only:
-        cur = conn.execute(
-            "SELECT id, code, original_url, created_at, expires_at, click_count "
-            "FROM links WHERE expires_at IS NULL OR expires_at > ? "
-            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (now.astimezone(timezone.utc).isoformat(), limit, offset),
-        )
-    else:
-        cur = conn.execute(
-            "SELECT id, code, original_url, created_at, expires_at, click_count "
-            "FROM links ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-    return [_row_to_link(row) for row in cur.fetchall()]
+    with lock:
+        conn.row_factory = sqlite3.Row
+        if active_only:
+            cur = conn.execute(
+                "SELECT id, code, original_url, created_at, expires_at, click_count "
+                "FROM links WHERE expires_at IS NULL OR expires_at > ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (now.astimezone(timezone.utc).isoformat(), limit, offset),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT id, code, original_url, created_at, expires_at, click_count "
+                "FROM links ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+        rows = cur.fetchall()
+    return [_row_to_link(row) for row in rows]

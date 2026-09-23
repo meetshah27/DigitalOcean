@@ -11,7 +11,7 @@ ALIAS_PATTERN = r"^[A-Za-z0-9_-]+$"
 
 
 class LinkCreateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid")
 
     url: str
     custom_alias: str | None = Field(default=None, min_length=3, max_length=30)
@@ -39,6 +39,13 @@ class LinkCreateRequest(BaseModel):
             raise ValueError("custom_alias may only contain letters, digits, '-' and '_'")
         if v.lower() in RESERVED_ALIASES:
             raise ValueError(f"custom_alias {v!r} is reserved")
+        return v
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def reject_non_string_expires_at(cls, v: object) -> object:
+        if v is not None and not isinstance(v, str):
+            raise ValueError("expires_at must be an ISO-8601 string, not a number")
         return v
 
     @field_validator("expires_at")

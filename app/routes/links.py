@@ -42,6 +42,21 @@ def _log(event: str, **fields) -> None:
     logger.info(event, extra={"extra_fields": {"request_id": get_request_id(), **fields}})
 
 
+def _idempotent_replay_after_race(
+    conn, lock, idempotency_key: str, response: Response
+) -> LinkResponse:
+    # We lost the insert race, but the winner committed a result for this same
+    # Idempotency-Key + payload in the same transaction we tried to write — that
+    # committed result is the correct response, not a code collision to retry.
+    existing = store.get_idempotency_record(conn, lock, idempotency_key)
+    assert existing is not None
+    link = store.get_link_by_code(conn, lock, existing.code)
+    assert link is not None
+    _log("link_create_replay_after_race", code=existing.code)
+    response.status_code = 200
+    return _to_response(link)
+
+
 @router.post("/links", response_model=LinkResponse, status_code=201)
 def create_link(payload: LinkCreateRequest, request: Request, response: Response):
     conn = get_connection()
@@ -51,14 +66,14 @@ def create_link(payload: LinkCreateRequest, request: Request, response: Response
 
     idempotency_key = request.headers.get(IDEMPOTENCY_HEADER)
     if idempotency_key is not None:
-        existing = store.get_idempotency_record(conn, idempotency_key)
+        existing = store.get_idempotency_record(conn, lock, idempotency_key)
         decision = processing.decide_idempotency(
             existing_hash=existing.request_hash if existing else None,
             existing_code=existing.code if existing else None,
             request_hash=request_hash,
         )
         if decision.outcome is processing.IdempotencyOutcome.REPLAY:
-            link = store.get_link_by_code(conn, decision.code)
+            link = store.get_link_by_code(conn, lock, decision.code)
             _log("link_create_replay", code=decision.code)
             response.status_code = 200
             return _to_response(link)
@@ -70,7 +85,7 @@ def create_link(payload: LinkCreateRequest, request: Request, response: Response
 
     alias_taken = False
     if payload.custom_alias is not None:
-        alias_taken = store.get_link_by_code(conn, payload.custom_alias) is not None
+        alias_taken = store.get_link_by_code(conn, lock, payload.custom_alias) is not None
 
     create_decision = processing.decide_create_link(
         custom_alias=payload.custom_alias,
@@ -87,16 +102,26 @@ def create_link(payload: LinkCreateRequest, request: Request, response: Response
         raise HTTPException(status_code=422, detail="expires_at must be in the future")
 
     if create_decision.code is not None:
-        link = store.create_link(
-            conn,
-            lock,
-            code=create_decision.code,
-            original_url=payload.url,
-            created_at=now,
-            expires_at=payload.expires_at,
-            idempotency_key=idempotency_key,
-            request_hash=request_hash,
-        )
+        try:
+            link = store.create_link(
+                conn,
+                lock,
+                code=create_decision.code,
+                original_url=payload.url,
+                created_at=now,
+                expires_at=payload.expires_at,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+            )
+        except store.IdempotencyKeyRaceError:
+            return _idempotent_replay_after_race(conn, lock, idempotency_key, response)
+        except store.CodeTakenError:
+            # The pre-check above (alias_taken) is a read-then-write race: two requests can
+            # both see the alias as free before either has inserted. The UNIQUE constraint is
+            # the real source of truth here; a collision at insert time is a genuine 409, not
+            # a bug in the pre-check.
+            _log("alias_taken", alias=payload.custom_alias)
+            raise HTTPException(status_code=409, detail="custom_alias is already in use") from None
     else:
         link = None
         last_error: Exception | None = None
@@ -114,6 +139,8 @@ def create_link(payload: LinkCreateRequest, request: Request, response: Response
                     request_hash=request_hash,
                 )
                 break
+            except store.IdempotencyKeyRaceError:
+                return _idempotent_replay_after_race(conn, lock, idempotency_key, response)
             except store.CodeTakenError as exc:
                 last_error = exc
                 continue
@@ -134,11 +161,12 @@ def list_links(
     offset: int = Query(default=0, ge=0),
 ):
     conn = get_connection()
+    lock = get_lock()
     now = datetime.now(timezone.utc)
     effective_limit = min(limit or settings.default_list_limit, settings.max_list_limit)
 
     links = store.list_links(
-        conn, active_only=active_only, now=now, limit=effective_limit, offset=offset
+        conn, lock, active_only=active_only, now=now, limit=effective_limit, offset=offset
     )
     _log(
         "list_links",
@@ -157,8 +185,9 @@ def list_links(
 @router.get("/links/{code}", response_model=LinkResponse)
 def get_link_metadata(code: str):
     conn = get_connection()
+    lock = get_lock()
     now = datetime.now(timezone.utc)
-    link = store.get_link_by_code(conn, code)
+    link = store.get_link_by_code(conn, lock, code)
     if link is None or processing.is_expired(link.expires_at, now):
         _log("metadata_lookup_miss", code=code)
         raise HTTPException(status_code=404, detail="short link not found")
@@ -171,7 +200,7 @@ def redirect_to_original(code: str):
     conn = get_connection()
     lock = get_lock()
     now = datetime.now(timezone.utc)
-    link = store.get_link_by_code(conn, code)
+    link = store.get_link_by_code(conn, lock, code)
     if link is None or processing.is_expired(link.expires_at, now):
         _log("redirect_miss", code=code)
         raise HTTPException(status_code=404, detail="short link not found")
