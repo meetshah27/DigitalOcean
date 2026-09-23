@@ -5,6 +5,8 @@
 A production-ready REST API that shortens long URLs, redirects short codes to
 their original URL, and returns metadata about created links.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the request lifecycle and data-flow diagrams.
+
 ## Requirements
 
 **Functional**
