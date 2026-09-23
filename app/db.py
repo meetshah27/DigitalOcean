@@ -15,6 +15,7 @@ def init_db() -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _connection = sqlite3.connect(str(db_path), check_same_thread=False)
     _connection.execute("PRAGMA journal_mode=WAL;")
+    _connection.execute("PRAGMA busy_timeout=5000;")
     logger.info("db_initialized", extra={"extra_fields": {"db_path": str(db_path)}})
 
 
