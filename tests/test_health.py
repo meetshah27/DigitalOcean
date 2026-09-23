@@ -36,11 +36,13 @@ def test_request_id_is_echoed_when_provided(client):
 
 
 def test_unhandled_exception_returns_generic_500_with_request_id(client):
-    @app.get("/__boom")
+    # Two path segments so this doesn't get shadowed by the /{code} redirect catch-all,
+    # which only matches a single segment and is registered ahead of routes added here.
+    @app.get("/__test__/boom")
     async def boom():
         raise RuntimeError("boom")
 
-    response = client.get("/__boom")
+    response = client.get("/__test__/boom")
     assert response.status_code == 500
     body = response.json()
     assert body["error"] == "internal_error"

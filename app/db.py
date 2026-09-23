@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 from app.config import settings
@@ -7,6 +8,11 @@ from app.config import settings
 logger = logging.getLogger("app.db")
 
 _connection: sqlite3.Connection | None = None
+
+# sqlite3.Connection is not safe for concurrent use from multiple threads even with
+# check_same_thread=False; FastAPI runs sync `def` handlers in a thread pool, so every
+# multi-statement store operation must hold this lock for its full check+write transaction.
+_lock = threading.Lock()
 
 
 def init_db() -> None:
@@ -16,6 +22,11 @@ def init_db() -> None:
     _connection = sqlite3.connect(str(db_path), check_same_thread=False)
     _connection.execute("PRAGMA journal_mode=WAL;")
     _connection.execute("PRAGMA busy_timeout=5000;")
+
+    from app.store import init_schema
+
+    init_schema(_connection)
+
     logger.info("db_initialized", extra={"extra_fields": {"db_path": str(db_path)}})
 
 
@@ -41,3 +52,7 @@ def get_connection() -> sqlite3.Connection:
     if _connection is None:
         raise RuntimeError("Database not initialized")
     return _connection
+
+
+def get_lock() -> threading.Lock:
+    return _lock

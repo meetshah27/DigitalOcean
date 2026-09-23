@@ -9,6 +9,8 @@ from app.errors import unhandled_exception_handler
 from app.logging_config import configure_logging
 from app.middleware import RequestContextMiddleware
 from app.routes.health import router as health_router
+from app.routes.links import redirect_router
+from app.routes.links import router as links_router
 
 configure_logging(settings.log_level)
 logger = logging.getLogger("app.startup")
@@ -30,7 +32,11 @@ def create_app() -> FastAPI:
     app = FastAPI(title="URL Shortener API", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.add_exception_handler(Exception, unhandled_exception_handler)
+    # Order matters: /{code} is a catch-all path param and must be registered last,
+    # otherwise it would shadow the exact-match routes below (/health, /ready, /links...).
     app.include_router(health_router)
+    app.include_router(links_router)
+    app.include_router(redirect_router)
     return app
 
 

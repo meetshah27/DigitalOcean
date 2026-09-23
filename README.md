@@ -31,17 +31,20 @@ their original URL, and returns metadata about created links.
 
 | Method | Path | Success | Errors |
 |---|---|---|---|
-| `POST` | `/links` | `201 Created` | `400` invalid URL/alias, `409` alias already taken |
+| `POST` | `/links` | `201 Created` (new), `200 OK` (idempotent replay) | `422` invalid url/alias/expiry, `409` alias already taken or `Idempotency-Key` reused with a different payload |
 | `GET` | `/{code}` | `302 Found` (redirect) | `404` not found or expired |
 | `GET` | `/links/{code}` | `200 OK` | `404` not found or expired |
+| `GET` | `/links` | `200 OK` (paginated list) | — |
 
 ### Input schema (`POST /links`)
 
 | Field | Type | Validation rule |
 |---|---|---|
-| `url` | string | required; must parse as `http`/`https`; max length 2048 |
-| `custom_alias` | string | optional; 3–30 chars; `[A-Za-z0-9_-]` only; case-sensitive; rejected if it matches a reserved word (`api`, `docs`, `health`, `links`) |
-| `expires_at` | datetime (ISO-8601, UTC) | optional; must be in the future at creation time |
+| `url` | string | required; must parse as `http`/`https`; max length 2048; extra/unknown fields rejected |
+| `custom_alias` | string | optional; 3–30 chars; `[A-Za-z0-9_-]` only; case-sensitive; rejected if it matches a reserved word (`api`, `docs`, `redoc`, `health`, `ready`, `links`, `openapi.json`) |
+| `expires_at` | datetime (ISO-8601) | optional; must include a UTC offset (naive datetimes are rejected, not silently assumed); normalized to UTC; must be in the future at creation time |
+
+Optional request header: `Idempotency-Key` — see Edge-case decisions below.
 
 ### Output schema
 
@@ -59,22 +62,25 @@ Echoed from input: `original_url`, `expires_at` (null if not supplied).
 
 | Rule | When it applies | Result |
 |---|---|---|
-| Auto-generate code | `custom_alias` omitted | random base62 string, 7 chars, regenerated on collision against the DB |
-| Custom alias validation | `custom_alias` provided | reject with `400` if it fails format rules; reject with `409` if already in use |
-| URL validation | always, on create | reject with `400` if scheme isn't `http`/`https` or length exceeds 2048 |
+| Auto-generate code | `custom_alias` omitted | random alphanumeric string (`secrets`, not `random`), `CODE_LENGTH` chars, regenerated on collision against the DB (bounded by `MAX_CODE_GENERATION_ATTEMPTS`) |
+| Custom alias validation | `custom_alias` provided | reject with `422` if it fails format rules; reject with `409` if already in use |
+| URL validation | always, on create | reject with `422` if scheme isn't `http`/`https` or length exceeds `MAX_URL_LENGTH` |
+| Expiry-in-the-past check | on create | if `expires_at` is not strictly after the current time, reject with `422` |
 | Expiry check | on redirect or metadata read | if `expires_at` is in the past, respond `404` (treated as gone, not distinguished from never-existed) |
 | Click counting | on redirect only | increment `click_count` synchronously before responding |
+| Idempotency-Key match | header present, same key + identical payload seen before | return `200` with the originally stored result (no new row created) |
+| Idempotency-Key mismatch | header present, same key + different payload | reject with `409` |
 
 ## Edge-case decisions
 
 | Case | Decision |
 |---|---|
-| Idempotency key | None. No `Idempotency-Key` header is supported; this is a deliberate scope cut, not an oversight. |
-| Duplicate URLs | Allowed. Submitting the same `url` twice creates two independent short codes; there is no dedup-by-URL. |
-| Timestamps/timezones | All timestamps stored and returned in UTC, ISO-8601 (`...Z`). No local-timezone conversion is performed server-side. |
-| Empty results | `GET /links/{code}` and `GET /{code}` return `404` (not an empty `200`) when a code doesn't exist or has expired. |
-| Ordering | Not applicable — there is no list/collection endpoint in this API, only single-resource lookups by code. |
-| Limits | `url` capped at 2048 chars; `custom_alias` capped at 30 chars; no rate limit on creation (explicitly out of scope). |
+| Idempotency key | Optional `Idempotency-Key` header, not a natural ID or content hash. Same key + same payload → `200` with the stored result; same key + different payload → `409`. No header → no dedup at all (see below). Chosen over content-hashing because hashing the body would force "same URL → same code" unconditionally, contradicting the next row. |
+| Duplicate URLs | Allowed when no `Idempotency-Key` is sent. Submitting the same `url` twice creates two independent short codes; there is no dedup-by-URL. |
+| Timestamps/timezones | All timestamps stored and returned in UTC, ISO-8601. Naive (timezone-less) input is rejected rather than assumed to be UTC. |
+| Empty results | `GET /links/{code}` and `GET /{code}` return `404` (not an empty `200`) when a code doesn't exist or has expired. `GET /links` returns `200` with an empty `items` list when nothing matches. |
+| Ordering | `GET /links` orders `created_at DESC, id DESC` — the `id` tiebreaker keeps results deterministic when two rows share a timestamp. |
+| Limits | `url` capped at `MAX_URL_LENGTH`; `custom_alias` capped at 30 chars; `GET /links` page size capped at `MAX_LIST_LIMIT`; no rate limit on creation (explicitly out of scope). |
 
 ## Configuration
 
@@ -85,6 +91,9 @@ Echoed from input: `original_url`, `expires_at` (null if not supplied).
 | `CODE_LENGTH` | `7` | Length of auto-generated short codes |
 | `MAX_URL_LENGTH` | `2048` | Max accepted length of the submitted `url` |
 | `LOG_LEVEL` | `INFO` | Application log verbosity |
+| `MAX_CODE_GENERATION_ATTEMPTS` | `5` | Retry bound when a randomly generated code collides with an existing one |
+| `DEFAULT_LIST_LIMIT` | `20` | Default page size for `GET /links` when `limit` isn't specified |
+| `MAX_LIST_LIMIT` | `100` | Hard cap on `GET /links` page size regardless of the requested `limit` |
 
 All values are read once at startup and validated (type/range checked); the app fails fast on an invalid config rather than falling back silently.
 
@@ -97,4 +106,6 @@ SQLite, as a single file on disk at `DB_PATH`. Data survives a process restart b
 - **SQLite over Postgres**: faster to stand up with no external dependency; the repository layer is written so swapping to Postgres later is a config + driver change, not a rewrite.
 - **302 over 301 redirects**: keeps every redirect hitting the server, so click counts and future expiry/deactivation logic stay accurate; a 301 risks being cached by browsers/CDNs indefinitely.
 - **Synchronous click counting**: simplest correct implementation for this scale; noted as a future bottleneck under high redirect traffic (would move to async/batched increments).
-- **Python 3.14 instead of the originally specified 3.11**: only 3.14 was available in this environment; no code in this stack relies on 3.11-specific behavior.
+- **Python 3.14 instead of the originally specified 3.11**: only 3.14 was available in this environment; no code in this stack relies on 3.11-specific behavior. CI still pins 3.11 via `actions/setup-python`, since GitHub-hosted runners support it even though this container doesn't.
+- **App-level lock around the shared SQLite connection**: FastAPI runs sync `def` handlers in a thread pool, and `sqlite3.Connection` isn't safe for concurrent use from multiple threads even with `check_same_thread=False`. A `threading.Lock` held for the full duration of each check-and-write transaction makes "check + write in one transaction" actually true, not just documented.
+- **Business rules split from schema validation**: format/type checks (URL scheme, alias charset/length/reserved words, timezone-awareness) live in `app/schemas.py` and need no facts beyond the input itself. Rules that need a fact from the current instant or the database (is this alias taken, is `expires_at` already in the past) live in `app/processing.py` as pure functions that take `now` and DB facts as arguments — they never call `datetime.now()` or query the DB themselves, which is what makes them unit-testable without spinning up the app.

@@ -1,6 +1,6 @@
 import sys
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     max_url_length: int = Field(default=2048, ge=1, le=8192)
     log_level: str = Field(default="INFO")
     port: int = Field(default=8000, ge=1, le=65535)
+    max_code_generation_attempts: int = Field(default=5, ge=1, le=20)
+    default_list_limit: int = Field(default=20, ge=1, le=100)
+    max_list_limit: int = Field(default=100, ge=1, le=1000)
 
     @field_validator("log_level")
     @classmethod
@@ -29,6 +32,12 @@ class Settings(BaseSettings):
         if not v.startswith(("http://", "https://")):
             raise ValueError(f"BASE_URL must start with http:// or https://, got {v!r}")
         return v.rstrip("/")
+
+    @model_validator(mode="after")
+    def validate_list_limits(self) -> "Settings":
+        if self.default_list_limit > self.max_list_limit:
+            raise ValueError("DEFAULT_LIST_LIMIT cannot exceed MAX_LIST_LIMIT")
+        return self
 
 
 def load_settings() -> Settings:
